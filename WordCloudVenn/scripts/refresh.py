@@ -5,7 +5,7 @@ from collections import defaultdict
 
 import requests
 import feedparser
-import psycopg
+import psycopg2
 import spacy
 
 # AWS SSM (OIDC/web identity)
@@ -430,3 +430,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
