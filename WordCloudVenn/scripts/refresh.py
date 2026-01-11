@@ -407,75 +407,95 @@ def write_to_neon(
     per_title_wordset: List[set[str]],
 ) -> None:
     """
-    Inserts into:
-      titles(source,url)
-      words(word,freq_omega,freq_cn,freq_guardian)
+    Fast bulk load into Neon/Postgres using psycopg2.
+
+    Assumptions (true for your pipeline):
+    - You TRUNCATE ... RESTART IDENTITY each run.
+    - Therefore, inserted IDs are sequential starting at 1 and match insertion order.
+      This lets us avoid slow SELECTs to map url->id and word->id.
+
+    Tables:
+      titles(source, url)
+      words(word, freq_omega, freq_cn, freq_guardian)
       title_words(title_id, word_id)
 
-    Uses a single transaction and truncates first, restarting identities.
+    Notes:
+    - Uses psycopg2.extras.execute_values for high-throughput multi-row inserts.
+    - Inserts title_words in chunks to avoid huge single statements.
     """
+    if not titles_rows:
+        raise RuntimeError("No titles_rows to write.")
+    if not words_rows:
+        raise RuntimeError("No words_rows to write.")
     if len(titles_rows) != len(per_title_wordset):
         raise ValueError("Internal error: titles_rows and per_title_wordset length mismatch.")
 
-    with psycopg2.connect(dsn) as conn:
+    from psycopg2.extras import execute_values
+
+    # Safety: cap join rows to avoid blowing free tier unexpectedly
+    # (you can tune or remove if you already cap upstream)
+    MAX_JOIN_ROWS = int(os.getenv("MAX_JOIN_ROWS", "50000"))
+
+    conn = psycopg2.connect(dsn, connect_timeout=30)
+    try:
+        conn.autocommit = False
         with conn.cursor() as cur:
-            try:
-                cur.execute("BEGIN;")
+            # Truncate first
+            cur.execute("BEGIN;")
+            cur.execute("TRUNCATE TABLE title_words, titles, words RESTART IDENTITY;")
 
-                # Your requested behavior
-                cur.execute("TRUNCATE TABLE title_words, titles, words RESTART IDENTITY;")
+            # Insert words (id will be 1..len(words_rows) in this exact order)
+            execute_values(
+                cur,
+                "INSERT INTO words(word, freq_omega, freq_cn, freq_guardian) VALUES %s",
+                words_rows,
+                page_size=2000,
+            )
 
-                # Insert words with frequencies (word is UNIQUE)
-                cur.executemany(
-                    """
-                    INSERT INTO words(word, freq_omega, freq_cn, freq_guardian)
-                    VALUES (%s, %s, %s, %s);
-                    """,
-                    words_rows,
+            # word -> id mapping by insertion order (fast, no DB roundtrip)
+            word_to_id = {w: idx + 1 for idx, (w, *_rest) in enumerate(words_rows)}
+
+            # Insert titles (id will be 1..len(titles_rows) in this exact order)
+            execute_values(
+                cur,
+                "INSERT INTO titles(source, url) VALUES %s",
+                titles_rows,
+                page_size=2000,
+            )
+
+            # Build join rows (presence-only)
+            join_rows: List[Tuple[int, int]] = []
+            for title_idx, ((source, url), wset) in enumerate(zip(titles_rows, per_title_wordset)):
+                title_id = title_idx + 1  # because of RESTART IDENTITY
+                for w in wset:
+                    wid = word_to_id.get(w)
+                    if wid is not None:
+                        join_rows.append((title_id, wid))
+
+            if len(join_rows) > MAX_JOIN_ROWS:
+                raise RuntimeError(
+                    f"Refusing to insert {len(join_rows)} title_words rows (MAX_JOIN_ROWS={MAX_JOIN_ROWS}). "
+                    "Lower your fetch caps or increase MAX_JOIN_ROWS."
                 )
 
-                # Map word -> id
-                cur.execute("SELECT id, word FROM words;")
-                word_to_id = {w: i for (i, w) in cur.fetchall()}
+            # Bulk insert join table in manageable chunks
+            execute_values(
+                cur,
+                "INSERT INTO title_words(title_id, word_id) VALUES %s",
+                join_rows,
+                page_size=5000,
+            )
 
-                # Insert titles
-                cur.executemany(
-                    "INSERT INTO titles(source, url) VALUES (%s, %s);",
-                    titles_rows,
-                )
-
-                # Map url -> title_id
-                cur.execute("SELECT id, url FROM titles;")
-                url_to_title_id = {u: i for (i, u) in cur.fetchall()}
-
-                # Build join rows (presence-only)
-                join_rows: List[Tuple[int, int]] = []
-                for (source, url), wset in zip(titles_rows, per_title_wordset):
-                    title_id = url_to_title_id.get(url)
-                    if title_id is None:
-                        raise RuntimeError(f"Missing title_id for url={url}")
-
-                    for w in wset:
-                        word_id = word_to_id.get(w)
-                        if word_id is not None:
-                            join_rows.append((title_id, word_id))
-
-                cur.executemany(
-                    "INSERT INTO title_words(title_id, word_id) VALUES (%s, %s);",
-                    join_rows,
-                )
-
-                cur.execute("COMMIT;")
-
-            except Exception:
-                cur.execute("ROLLBACK;")
-                raise
+            cur.execute("COMMIT;")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-# ----------------------------
-# Main pipeline
-# ----------------------------
-def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
+def main():
+rss_omega, rss_cn, guardian_api_key, neon_dsn):
 
     # --- Fetch ---
     items: List[Item] = []
@@ -516,7 +536,7 @@ def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
 
     # --- Caps to protect Neon free tier ---
     caps = {
-        "titles": 600,
+        "titles": 6000,
         "words": 15000,
         "title_words": 45000,
     }
@@ -552,7 +572,6 @@ def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
 if __name__ == "__main__":
     rss_omega, rss_cn, guardian_api_key, neon_dsn = load_runtime_config()
     main(rss_omega, rss_cn, guardian_api_key, neon_dsn)
-
 
 
 
