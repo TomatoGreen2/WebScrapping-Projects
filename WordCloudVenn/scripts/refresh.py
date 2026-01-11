@@ -417,7 +417,7 @@ def write_to_neon(
     if len(titles_rows) != len(per_title_wordset):
         raise ValueError("Internal error: titles_rows and per_title_wordset length mismatch.")
 
-    with psycopg.connect(dsn) as conn:
+    with psycopg2.connect(dsn) as conn:
         with conn.cursor() as cur:
             try:
                 cur.execute("BEGIN;")
@@ -533,7 +533,7 @@ def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
 
     # Print DB identity (helps detect DSN mismatches)
     try:
-        with psycopg.connect(neon_dsn) as _conn:
+        with psycopg2.connect(neon_dsn) as _conn:
             with _conn.cursor() as _cur:
                 _cur.execute("SELECT current_database(), current_user;")
                 dbname, dbuser = _cur.fetchone()
@@ -552,5 +552,6 @@ def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
 if __name__ == "__main__":
     rss_omega, rss_cn, guardian_api_key, neon_dsn = load_runtime_config()
     main(rss_omega, rss_cn, guardian_api_key, neon_dsn)
+
 
 
