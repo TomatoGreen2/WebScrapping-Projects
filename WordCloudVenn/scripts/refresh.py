@@ -516,7 +516,7 @@ def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
 
     # --- Caps to protect Neon free tier ---
     caps = {
-        "titles": 6000,
+        "titles": 600,
         "words": 15000,
         "title_words": 45000,
     }
@@ -552,6 +552,7 @@ def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
 if __name__ == "__main__":
     rss_omega, rss_cn, guardian_api_key, neon_dsn = load_runtime_config()
     main(rss_omega, rss_cn, guardian_api_key, neon_dsn)
+
 
 
 
