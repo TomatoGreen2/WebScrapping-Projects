@@ -1,0 +1,66 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Venn Wordcloud</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+
+<body>
+    <header class="wrap">
+        <h1>Venn Diagram Wordcloud</h1>
+        <p class="sub">
+            Three lists: <b>ACS Omega</b>, <b>ACS Axial</b>, <b>The Guardian</b>.
+            Shared words appear in overlap regions. Repeated occurrences increase font size.
+        </p>
+
+        <div class="bar">
+            <button id="reloadBtn" type="button">Reload lists.txt</button>
+            <span id="status" class="status">Initializing…</span>
+        </div>
+    </header>
+
+    <main class="wrap">
+        <section class="card">
+            <canvas id="vennCanvas" width="1100" height="700"></canvas>
+        </section>
+
+        <aside class="card legend">
+            <h2>Legend</h2>
+            <ul>
+                <li><span class="swatch a"></span> ACS Omega</li>
+                <li><span class="swatch b"></span> ACS Axial</li>
+                <li><span class="swatch c"></span> The Guardian</li>
+            </ul>
+            <p class="hint">
+                Data source: <code>lists.txt</code> (loaded by <code>app.js</code>).
+            </p>
+        </aside>
+
+        <!-- New: plain lists below diagram -->
+        <section class="card" id="listsPanel">
+            <h2>Words by source (alphabetical, including duplicates)</h2>
+
+            <div class="wordlists">
+                <div class="wordlist">
+                    <h3>ACS Omega</h3>
+                    <p id="listOmega" class="words"></p>
+                </div>
+
+                <div class="wordlist">
+                    <h3>ACS Axial</h3>
+                    <p id="listAxial" class="words"></p>
+                </div>
+
+                <div class="wordlist">
+                    <h3>The Guardian</h3>
+                    <p id="listGuardian" class="words"></p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src="app.js" defer></script>
+</body>
+</html>
