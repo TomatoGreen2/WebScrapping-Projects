@@ -57,4 +57,4 @@ jobs:
       # ---- Run ETL refresh ----
       - name: Run refresh script (truncate + repopulate DB)
         run: |
-          python scripts/refresh.py
+          python WordCloudVenn/scripts/refresh.py
