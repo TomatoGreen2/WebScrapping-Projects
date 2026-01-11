@@ -5,7 +5,7 @@ from collections import defaultdict
 
 import requests
 import feedparser
-import psycopg
+import psycopg2
 import spacy
 
 
@@ -552,3 +552,4 @@ def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
 if __name__ == "__main__":
     rss_omega, rss_cn, guardian_api_key, neon_dsn = load_runtime_config()
     main(rss_omega, rss_cn, guardian_api_key, neon_dsn)
+
