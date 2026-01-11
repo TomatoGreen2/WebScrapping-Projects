@@ -5,25 +5,134 @@ from collections import defaultdict
 
 import requests
 import feedparser
-import psycopg2
+import psycopg
 import spacy
-
-# AWS SSM (OIDC/web identity)
-import boto3
-
-
-# ----------------------------
-# Global URLs (you said you moved these here)
-# ----------------------------
-RSS_OMEGA_DEFAULT = "https://pubs.acs.org/action/showFeed?type=axatoc&feed=rss&jc=acsodf"
-RSS_CN_DEFAULT = "https://cen.acs.org/feeds/rss/latestnews.xml?_gl=1*1dc2duf*_ga*NDA0MzU4MjAyLjE3Njc4MTQ0NTk.*_ga_XP5JV6H8Q6*czE3Njc4MTQ0NTkkbzEkZzAkdDE3Njc4MTQ0NTkkajYwJGwwJGgw"
-GUARDIAN_SEARCH_URL = "https://content.guardianapis.com/search"
 
 
 # ----------------------------
 # spaCy setup (load once)
 # ----------------------------
+# Make sure you've installed a model, e.g.:
+#   python -m spacy download en_core_web_sm
 nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
+
+
+#--------------------------
+# key variables
+#-----------------------------
+# Runtime configuration
+#-----------------------------
+GUARDIAN_SEARCH_URL = "https://content.guardianapis.com/search"
+
+DEFAULT_RSS_OMEGA = "https://pubs.acs.org/action/showFeed?type=axatoc&feed=rss&jc=acsodf"
+DEFAULT_RSS_CN = "https://cen.acs.org/feeds/rss/latestnews.xml"
+
+# Environment variables (optional local/dev fallbacks)
+# - If GUARDIAN_API_KEY / DATABASE_URL are present, we use them directly.
+# - Otherwise, in GitHub Actions we can load them from AWS SSM Parameter Store via OIDC.
+ENV_GUARDIAN_API_KEY = "GUARDIAN_API_KEY"
+ENV_DATABASE_URL = "DATABASE_URL"
+
+# SSM parameter name env vars (set in your GitHub Actions workflow)
+ENV_SSM_NEON_PARAM = "SSM_PARAM_NEON_DATABASE_URL"
+ENV_SSM_GUARDIAN_PARAM = "SSM_PARAM_GUARDIAN_API_KEY"
+ENV_SSM_RSS_OMEGA_PARAM = "SSM_PARAM_RSS_OMEGA"
+ENV_SSM_RSS_CN_PARAM = "SSM_PARAM_RSS_CN"
+
+# AWS region env var (set in workflow)
+ENV_AWS_REGION = "AWS_REGION"
+
+
+def load_params_from_ssm(param_names: List[str], *, region: str) -> Dict[str, str]:
+    """Load multiple SSM parameters in a single call (SecureString supported).
+
+    Returns: {param_name: value}
+    Raises: RuntimeError if any requested parameter is missing or not accessible.
+    """
+    # boto3 is only needed in CI; keep import local to avoid forcing it for all local runs.
+    import boto3  # type: ignore
+
+    # De-dup and keep order
+    seen: set[str] = set()
+    names: List[str] = []
+    for n in param_names:
+        if n and n not in seen:
+            seen.add(n)
+            names.append(n)
+
+    if not names:
+        return {}
+
+    ssm = boto3.client("ssm", region_name=region)
+    resp = ssm.get_parameters(Names=names, WithDecryption=True)
+
+    invalid = resp.get("InvalidParameters") or []
+    if invalid:
+        raise RuntimeError(f"SSM parameters not found or not accessible: {invalid}")
+
+    out: Dict[str, str] = {}
+    for p in resp.get("Parameters", []):
+        out[p["Name"]] = p.get("Value", "")
+    return out
+
+
+def load_runtime_config() -> tuple[str, str, str, str]:
+    """Resolve RSS URLs + Guardian key + Neon DSN.
+
+    Priority:
+      1) Direct env vars: DATABASE_URL, GUARDIAN_API_KEY
+      2) AWS SSM (names provided via SSM_PARAM_* env vars)
+      3) Defaults for RSS feeds only
+    """
+    rss_omega = os.getenv("RSS_OMEGA", "") or DEFAULT_RSS_OMEGA
+    rss_cn = os.getenv("RSS_CN", "") or DEFAULT_RSS_CN
+
+    guardian_api_key = os.getenv(ENV_GUARDIAN_API_KEY, "")
+    neon_dsn = os.getenv(ENV_DATABASE_URL, "")
+
+    # If secrets are missing, try SSM
+    region = os.getenv(ENV_AWS_REGION, "eu-central-1")
+
+    needed_ssm: List[str] = []
+
+    neon_param = os.getenv(ENV_SSM_NEON_PARAM, "")
+    guardian_param = os.getenv(ENV_SSM_GUARDIAN_PARAM, "")
+
+    if not neon_dsn and neon_param:
+        needed_ssm.append(neon_param)
+    if not guardian_api_key and guardian_param:
+        needed_ssm.append(guardian_param)
+
+    # Optional RSS overrides from SSM
+    rss_omega_param = os.getenv(ENV_SSM_RSS_OMEGA_PARAM, "")
+    rss_cn_param = os.getenv(ENV_SSM_RSS_CN_PARAM, "")
+
+    if rss_omega_param:
+        needed_ssm.append(rss_omega_param)
+    if rss_cn_param:
+        needed_ssm.append(rss_cn_param)
+
+    if needed_ssm:
+        loaded = load_params_from_ssm(needed_ssm, region=region)
+        if not neon_dsn and neon_param:
+            neon_dsn = loaded.get(neon_param, neon_dsn)
+        if not guardian_api_key and guardian_param:
+            guardian_api_key = loaded.get(guardian_param, guardian_api_key)
+
+        if rss_omega_param:
+            rss_omega = loaded.get(rss_omega_param, rss_omega) or rss_omega
+        if rss_cn_param:
+            rss_cn = loaded.get(rss_cn_param, rss_cn) or rss_cn
+
+    return rss_omega, rss_cn, guardian_api_key, neon_dsn
+
+
+#---------------------------------------
+# functions
+#--------------------------------------------
+
+# functions
+#--------------------------------------------
 
 
 def tokenize_keywords_spacy(
@@ -40,14 +149,20 @@ def tokenize_keywords_spacy(
     for t in doc:
         if not t.is_alpha:
             continue
+
         lemma = t.lemma_.lower()
+
         if t.is_stop or lemma in extra:
             continue
+
         if t.pos_ not in allowed_pos:
             continue
+
         if len(lemma) < min_len:
             continue
+
         out.append(lemma)
+
     return out
 
 
@@ -56,80 +171,9 @@ def tokenize_keywords_spacy(
 # ----------------------------
 @dataclass(frozen=True)
 class Item:
-    source: str  # must be one of: 'OMEGA', 'CN', 'GUARDIAN'
+    source: str  # must be one of: 'OMEGA', 'CN', 'GUARDIAN' (per CHECK constraint)
     url: str
-    keywords: List[str]
-
-
-# ----------------------------
-# Multi-parameter SSM loader (single API call)
-# ----------------------------
-def load_params_from_ssm(names: List[str]) -> Dict[str, str]:
-    """
-    Loads multiple SSM parameters at once using WithDecryption=True.
-    Requires AWS credentials (OIDC role) to already be configured in environment.
-
-    Returns dict: {param_name: param_value}
-    Raises on missing params.
-    """
-    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "eu-central-1"
-    ssm = boto3.client("ssm", region_name=region)
-
-    resp = ssm.get_parameters(Names=names, WithDecryption=True)
-    found = {p["Name"]: p["Value"] for p in resp.get("Parameters", [])}
-    invalid = resp.get("InvalidParameters", [])
-
-    if invalid:
-        raise RuntimeError(f"SSM parameters not found or not accessible: {invalid}")
-
-    return found
-
-
-def load_runtime_config() -> tuple[str, str, str, str]:
-    """
-    Returns:
-      (neon_dsn, guardian_api_key, rss_omega, rss_cn)
-
-    Precedence:
-      1) env vars (DATABASE_URL, GUARDIAN_API_KEY, RSS_OMEGA, RSS_CN) if set
-      2) SSM parameters (names provided via env vars SSM_PARAM_*)
-      3) fall back to hardcoded defaults for RSS URLs only
-    """
-    # 1) direct env vars for local dev
-    neon_dsn = os.getenv("DATABASE_URL", "").strip()
-    guardian_key = os.getenv("GUARDIAN_API_KEY", "").strip()
-    rss_omega = os.getenv("RSS_OMEGA", "").strip()
-    rss_cn = os.getenv("RSS_CN", "").strip()
-
-    # 2) SSM param names (workflow sets these)
-    ssm_neon_name = os.getenv("SSM_PARAM_NEON_DATABASE_URL", "").strip()
-    ssm_guardian_name = os.getenv("SSM_PARAM_GUARDIAN_API_KEY", "").strip()
-    ssm_rss_omega_name = os.getenv("SSM_PARAM_RSS_OMEGA", "").strip()
-    ssm_rss_cn_name = os.getenv("SSM_PARAM_RSS_CN", "").strip()
-
-    # Decide which SSM params we still need
-    needed: List[str] = []
-    if not neon_dsn and ssm_neon_name:
-        needed.append(ssm_neon_name)
-    if not guardian_key and ssm_guardian_name:
-        needed.append(ssm_guardian_name)
-    if not rss_omega and ssm_rss_omega_name:
-        needed.append(ssm_rss_omega_name)
-    if not rss_cn and ssm_rss_cn_name:
-        needed.append(ssm_rss_cn_name)
-
-    if needed:
-        loaded = load_params_from_ssm(needed)
-        neon_dsn = neon_dsn or loaded.get(ssm_neon_name, "").strip()
-        guardian_key = guardian_key or loaded.get(ssm_guardian_name, "").strip()
-        rss_omega = rss_omega or loaded.get(ssm_rss_omega_name, "").strip()
-        rss_cn = rss_cn or loaded.get(ssm_rss_cn_name, "").strip()
-
-    # 3) fall back for RSS defaults if still empty
-    rss_omega = rss_omega or RSS_OMEGA_DEFAULT
-    rss_cn = rss_cn or RSS_CN_DEFAULT
-
-    return neon_dsn, guardian_key, rss_omega, rss_cn
+    keywords: List[str]  # may contain duplicates; we'll dedupe per title later
 
 
 # ----------------------------
@@ -153,6 +197,7 @@ def fetch_rss_entries(rss_url: str, timeout: int = 30) -> List[Tuple[str, str]]:
             or (entry.get("guid") or "").strip()
         )
 
+        # Atom feeds sometimes use a list of links
         if not link and entry.get("links"):
             for l in entry.get("links", []):
                 href = (l.get("href") or "").strip()
@@ -187,8 +232,11 @@ def items_from_rss(
 
 
 # ----------------------------
-# Guardian fetch
+# Guardian API fetch
 # ----------------------------
+
+
+
 def fetch_guardian_section(
     section: str,
     api_key: str,
@@ -264,6 +312,7 @@ def items_from_guardian(
 
             tags = guardian_keyword_tags(r) if prefer_guardian_tags else []
             if tags:
+                # Normalize tags through the same spaCy pipeline
                 kws: List[str] = []
                 for tag in tags:
                     kws.extend(
@@ -285,10 +334,20 @@ def items_from_guardian(
 
 
 # ----------------------------
-# Build rows for your DB schema
+# Organize to match YOUR schema
 # ----------------------------
 def build_rows_for_schema(items: List[Item]):
-    # Deduplicate by URL (titles.url is UNIQUE)
+    """
+    Produces rows aligned with schema_01_v_01.sql:
+
+      titles: (source, url)
+      words:  (word, freq_omega, freq_cn, freq_guardian)
+      title_words: built after IDs exist (title_id, word_id)
+
+    Also returns:
+      per_title_wordset: list[set[str]] aligned to titles_rows order
+    """
+    # 1) Deduplicate by URL (since titles.url is UNIQUE).
     url_seen = set()
     deduped: List[Item] = []
     for it in items:
@@ -297,44 +356,64 @@ def build_rows_for_schema(items: List[Item]):
         url_seen.add(it.url)
         deduped.append(it)
 
+    # 2) Build titles rows + per-title unique word sets (presence-only join)
     titles_rows: List[Tuple[str, str]] = []
     per_title_wordset: List[set[str]] = []
 
     for it in deduped:
         if it.source not in ("OMEGA", "CN", "GUARDIAN"):
-            raise ValueError(f"Invalid source '{it.source}'.")
+            raise ValueError(f"Invalid source '{it.source}' (must match schema CHECK constraint).")
         titles_rows.append((it.source, it.url))
         per_title_wordset.append(set(it.keywords))
 
+    # 3) Build per-word document frequency per source
     freqs: Dict[str, Dict[str, int]] = defaultdict(lambda: {"OMEGA": 0, "CN": 0, "GUARDIAN": 0})
+
     for (source, _url), wset in zip(titles_rows, per_title_wordset):
         for w in wset:
             freqs[w][source] += 1
 
+    # 4) words_rows in stable sorted order
     words_rows: List[Tuple[str, int, int, int]] = []
     for w in sorted(freqs.keys()):
         words_rows.append((w, freqs[w]["OMEGA"], freqs[w]["CN"], freqs[w]["GUARDIAN"]))
 
+    # For sanity/limits
     summary = {
         "titles": len(titles_rows),
         "words": len(words_rows),
         "title_words": sum(len(s) for s in per_title_wordset),
     }
+
     return titles_rows, words_rows, per_title_wordset, summary
 
 
+# ----------------------------
+# Safety caps (avoid free-tier blowups)
+# ----------------------------
 def enforce_caps(summary: dict, caps: dict) -> None:
     for k, cap in caps.items():
         if summary.get(k, 0) > cap:
             raise ValueError(f"{k}={summary.get(k)} exceeds cap={cap}")
 
 
+# ----------------------------
+# DB write (matches TRUNCATE requirement)
+# ----------------------------
 def write_to_neon(
     dsn: str,
     titles_rows: List[Tuple[str, str]],
     words_rows: List[Tuple[str, int, int, int]],
     per_title_wordset: List[set[str]],
 ) -> None:
+    """
+    Inserts into:
+      titles(source,url)
+      words(word,freq_omega,freq_cn,freq_guardian)
+      title_words(title_id, word_id)
+
+    Uses a single transaction and truncates first, restarting identities.
+    """
     if len(titles_rows) != len(per_title_wordset):
         raise ValueError("Internal error: titles_rows and per_title_wordset length mismatch.")
 
@@ -342,8 +421,11 @@ def write_to_neon(
         with conn.cursor() as cur:
             try:
                 cur.execute("BEGIN;")
+
+                # Your requested behavior
                 cur.execute("TRUNCATE TABLE title_words, titles, words RESTART IDENTITY;")
 
+                # Insert words with frequencies (word is UNIQUE)
                 cur.executemany(
                     """
                     INSERT INTO words(word, freq_omega, freq_cn, freq_guardian)
@@ -352,19 +434,23 @@ def write_to_neon(
                     words_rows,
                 )
 
+                # Map word -> id
                 cur.execute("SELECT id, word FROM words;")
                 word_to_id = {w: i for (i, w) in cur.fetchall()}
 
+                # Insert titles
                 cur.executemany(
                     "INSERT INTO titles(source, url) VALUES (%s, %s);",
                     titles_rows,
                 )
 
+                # Map url -> title_id
                 cur.execute("SELECT id, url FROM titles;")
                 url_to_title_id = {u: i for (i, u) in cur.fetchall()}
 
+                # Build join rows (presence-only)
                 join_rows: List[Tuple[int, int]] = []
-                for (_source, url), wset in zip(titles_rows, per_title_wordset):
+                for (source, url), wset in zip(titles_rows, per_title_wordset):
                     title_id = url_to_title_id.get(url)
                     if title_id is None:
                         raise RuntimeError(f"Missing title_id for url={url}")
@@ -380,54 +466,89 @@ def write_to_neon(
                 )
 
                 cur.execute("COMMIT;")
+
             except Exception:
                 cur.execute("ROLLBACK;")
                 raise
 
 
-def main():
-    neon_dsn, guardian_key, rss_omega, rss_cn = load_runtime_config()
+# ----------------------------
+# Main pipeline
+# ----------------------------
+def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
 
-    # Fetch
+    # --- Fetch ---
     items: List[Item] = []
-    items += items_from_rss(rss_omega, source="OMEGA", extra_stopwords=["acs", "omega"])
-    items += items_from_rss(rss_cn, source="CN", extra_stopwords=["acs", "cen", "c", "n"])
 
-    if guardian_key:
-        items += items_from_guardian(
-            guardian_key,
+    omega_items = items_from_rss(rss_omega, source="OMEGA", extra_stopwords=["acs", "omega"])
+    print(f"Fetched OMEGA items: {len(omega_items)}")
+    items += omega_items
+
+    if rss_cn:
+        cn_items = items_from_rss(rss_cn, source="CN", extra_stopwords=["acs", "cen", "c", "n"])
+        print(f"Fetched CN items: {len(cn_items)}")
+        items += cn_items
+    else:
+        print("CN RSS URL not set; skipping CN.")
+
+    if guardian_api_key:
+        guardian_items = items_from_guardian(
+            guardian_api_key,
             sections=["science", "technology"],
             pages=2,
             page_size=50,
             prefer_guardian_tags=True,
             extra_stopwords=["guardian"],
         )
+        print(f"Fetched Guardian items: {len(guardian_items)}")
+        items += guardian_items
+    else:
+        print("GUARDIAN_API_KEY not set; skipping Guardian.")
 
+    # --- Only write if we actually fetched data ---
     if not items:
         print("No data fetched; skipping DB write.")
         return
 
+    # --- Organize for schema ---
     titles_rows, words_rows, per_title_wordset, summary = build_rows_for_schema(items)
     print("Prepared:", summary)
 
-    caps = {"titles": 400, "words": 5000, "title_words": 15000}
+    # --- Caps to protect Neon free tier ---
+    caps = {
+        "titles": 400,
+        "words": 5000,
+        "title_words": 15000,
+    }
     try:
         enforce_caps(summary, caps)
     except ValueError as e:
         print("Too much data; skipping DB write:", e)
         return
 
+    # --- Write with try/except and show errors ---
     if not neon_dsn:
-        print("DATABASE_URL not set (env or SSM); skipping DB write.")
+        print("DATABASE_URL not set; skipping DB write.")
         return
+
+    # Print DB identity (helps detect DSN mismatches)
+    try:
+        with psycopg.connect(neon_dsn) as _conn:
+            with _conn.cursor() as _cur:
+                _cur.execute("SELECT current_database(), current_user;")
+                dbname, dbuser = _cur.fetchone()
+                print(f"Connected to DB: {dbname} as {dbuser}")
+    except Exception as _e:
+        print("Could not verify DB identity:", repr(_e))
 
     try:
         write_to_neon(neon_dsn, titles_rows, words_rows, per_title_wordset)
         print("DB write succeeded.")
     except Exception as e:
-        print("DB write failed:", repr(e))
+        print("DB write failed:")
+        print(repr(e))
 
 
 if __name__ == "__main__":
-    main()
-
+    rss_omega, rss_cn, guardian_api_key, neon_dsn = load_runtime_config()
+    main(rss_omega, rss_cn, guardian_api_key, neon_dsn)
