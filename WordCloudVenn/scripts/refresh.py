@@ -494,8 +494,7 @@ def write_to_neon(
         conn.close()
 
 
-def main():
-rss_omega, rss_cn, guardian_api_key, neon_dsn):
+def main(rss_omega, rss_cn, guardian_api_key, neon_dsn):
 
     # --- Fetch ---
     items: List[Item] = []
@@ -572,6 +571,7 @@ rss_omega, rss_cn, guardian_api_key, neon_dsn):
 if __name__ == "__main__":
     rss_omega, rss_cn, guardian_api_key, neon_dsn = load_runtime_config()
     main(rss_omega, rss_cn, guardian_api_key, neon_dsn)
+
 
 
 
